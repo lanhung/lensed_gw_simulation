@@ -30,28 +30,14 @@ def sample_astro_population(N):
 # 第二步：注入透镜效应
 #################################
 def lensing_amplification_point_lens(y, f, M_L):
-    """
-    基于波动光学理论，使用近似点透镜模型计算频率相关放大因子。
-    y: 无量纲冲击参数（impact parameter）
-    f: 频率数组
-    M_L: 透镜质量（单位：太阳质量）
-    返回: 每个频率下的复数放大因子
-    """
     from scipy.special import gamma, hyp1f1
-    omega = 2 * np.pi * f * 4.9254909e-6 * M_L  # 将 M_sun 转换为秒，f 转为自然单位频率
+    omega = 2 * np.pi * f * 4.9254909e-6 * M_L
     w = omega + 1e-6
     phi = np.pi * w / 4 + w * (np.log(w / 2) - 1)
     F_w = np.exp(np.pi * w / 4) * gamma(1 - 1j * w) * hyp1f1(1j * w, 1, 1j * w * y**2 / 2) * np.exp(1j * phi)
     return np.abs(F_w)
 
 def lensing_amplification_sie(f, y, sigma_v):
-    """
-    使用 SIE 星系透镜模型的近似频率响应
-    f: 频率数组
-    y: impact parameter
-    sigma_v: 星系速度弥散（km/s）
-    返回: 模拟放大因子（幅值）
-    """
     velocity_term = (sigma_v / 200.0)**2
     amplification = 1 + velocity_term / (1 + y**2) * np.exp(-f / 300.0)
     return amplification
@@ -102,3 +88,68 @@ def visualize_summary(df):
     for name, group in lens_groups:
         det_rate = (group['snr'] > 8).sum() / len(group)
         print(f"透镜类型 {name} 的探测率：{det_rate:.2%}")
+
+#########################################
+# 主函数：整合各阶段调用逻辑
+#########################################
+def main():
+    N = 1000000
+    N_lensed = 100
+    delta_t = 1.0 / 4096
+    length = 4.0
+
+    m1, m2, spin, z = sample_astro_population(N)
+    is_lensed = np.zeros(N, dtype=bool)
+    is_lensed[np.random.choice(N, N_lensed, replace=False)] = True
+
+    records = []
+    for i in range(N_lensed):
+        hp, _ = get_td_waveform(approximant="IMRPhenomPv2",
+                                mass1=m1[i],
+                                mass2=m2[i],
+                                delta_t=delta_t,
+                                f_lower=20.0)
+
+        h = hp[:int(length / delta_t)]
+        if len(h) < int(length / delta_t):
+            h = np.pad(h, (0, int(length / delta_t) - len(h)))
+
+        use_sie = (i % 2 == 0)
+        f = np.fft.rfftfreq(len(h), d=delta_t)
+        if use_sie:
+            mu_f = lensing_amplification_sie(f, y=0.6, sigma_v=220)
+            lens_type = "SIE"
+        else:
+            mu_f = lensing_amplification_point_lens(0.5, f, 1e6)
+            lens_type = "Point"
+
+        h_f = np.fft.rfft(h)
+        h_f_lensed = apply_lensing_effects(h_f, mu_f)
+        h_lensed = np.fft.irfft(h_f_lensed)
+
+        noise = simulate_et_noise(length, delta_t)
+        h_injected = inject_signal_into_noise(h_lensed, noise, snr_target=10)
+
+        snr = compute_snr(h_lensed, noise)
+        peak_f, mean_amp, std_amp = extract_features(h_injected)
+
+        records.append({
+            "id": i,
+            "lens_type": lens_type,
+            "snr": snr,
+            "peak_freq_idx": peak_f,
+            "mean_amp": mean_amp,
+            "std_amp": std_amp,
+            "mass_1": m1[i],
+            "mass_2": m2[i],
+            "spin": spin[i],
+            "redshift": z[i]
+        })
+
+    df = pd.DataFrame(records)
+    df.to_csv("lensed_signals_summary.csv", index=False)
+    print(f"已输出特征摘要至 lensed_signals_summary.csv，平均SNR: {np.mean(df['snr']):.2f}")
+    visualize_summary(df)
+
+if __name__ == '__main__':
+    main()
